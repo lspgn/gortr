@@ -183,8 +183,9 @@ func (s *state) fetchFile(file string) ([]byte, bool, error) {
 		req.Header.Set("User-Agent", s.userAgent)
 		req.Header.Set("Accept", "text/json")
 
-		if s.etags[file] != "" {
-			req.Header.Set("If-None-Match", s.etags[file])
+		etag, ok := s.etags[file]
+		if ok {
+			req.Header.Set("If-None-Match", etag)
 		}
 
 		proxyurl, err := http.ProxyFromEnvironment(req)
@@ -215,11 +216,7 @@ func (s *state) fetchFile(file string) ([]byte, bool, error) {
 		f = fhttp.Body
 
 		newEtag := fhttp.Header.Get("ETag")
-		if newEtag != "" {
-			wasModified = s.EtagWasUpdated(file, newEtag)
-		} else {
-			wasModified = true
-		}
+		wasModified = s.FileWasUpdated(file, newEtag)
 	} else {
 		f, err = os.Open(file)
 		if err != nil {
@@ -300,8 +297,11 @@ func (e IdenticalFile) Error() string {
 	return fmt.Sprintf("File %v is identical to the previous version", e.File)
 }
 
-func (s *state) EtagWasUpdated(file string, newEtag string) (updated bool) {
-	updated = newEtag != "" && newEtag != s.etags[file]
+func (s *state) FileWasUpdated(file string, newEtag string) (updated bool) {
+	if newEtag == "" {
+		return true
+	}
+	updated = newEtag != s.etags[file]
 	if updated {
 		log.Debugf("File was updated, Etag: '%s' -> '%s'", s.etags[file], newEtag)
 	}
