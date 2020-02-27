@@ -75,6 +75,7 @@ var (
 	PublicKey = flag.String("verify.key", "cf.pub", "Public key path (PEM file)")
 
 	CacheBin        = flag.String("cache", "https://rpki.cloudflare.com/rpki.json", "URL of the cached JSON data")
+	Etag            = flag.Bool("etag", true, "Enable Etag header")
 	UserAgent       = flag.String("useragent", fmt.Sprintf("Cloudflare-%v (+https://github.com/cloudflare/gortr)", AppVersion), "User-Agent header")
 	RefreshInterval = flag.Int("refresh", 600, "Refresh interval in seconds")
 	MaxConn         = flag.Int("maxconn", 0, "Max simultaneous connections (0 to disable limit)")
@@ -184,7 +185,7 @@ func (s *state) fetchFile(file string) ([]byte, bool, error) {
 		req.Header.Set("Accept", "text/json")
 
 		etag, ok := s.etags[file]
-		if ok {
+		if s.enableEtags && ok {
 			req.Header.Set("If-None-Match", etag)
 		}
 
@@ -216,16 +217,27 @@ func (s *state) fetchFile(file string) ([]byte, bool, error) {
 		f = fhttp.Body
 
 		newEtag := fhttp.Header.Get("ETag")
-		wasModified = s.FileWasUpdated(file, newEtag)
+
+		if !s.enableEtags || newEtag == "" || newEtag != s.etags[file] {
+			s.etags[file] = newEtag
+			wasModified = true
+		}
+
+		if !wasModified {
+			return nil, wasModified, IdenticalEtag{
+				File: file,
+				Etag: newEtag,
+			}
+		}
 	} else {
 		f, err = os.Open(file)
 		if err != nil {
 			return nil, false, err
 		}
 	}
-	data, err2 := ioutil.ReadAll(f)
-	if err2 != nil {
-		return nil, false, err2
+	data, err := ioutil.ReadAll(f)
+	if err != nil {
+		return nil, false, err
 	}
 	return data, wasModified, nil
 }
@@ -271,7 +283,7 @@ func processData(roalistjson []prefixfile.ROAJson) ([]rtr.ROA, int, int, int) {
 			countv6++
 		}
 
-		key := fmt.Sprintf("%v,%v,%v", prefix, asn, v.Length)
+		key := fmt.Sprintf("%s,%d,%d", prefix, asn, v.Length)
 		_, exists := filterDuplicates[key]
 		if !exists {
 			filterDuplicates[key] = true
@@ -294,28 +306,24 @@ type IdenticalFile struct {
 }
 
 func (e IdenticalFile) Error() string {
-	return fmt.Sprintf("File %v is identical to the previous version", e.File)
+	return fmt.Sprintf("File %s is identical to the previous version", e.File)
 }
 
-func (s *state) FileWasUpdated(file string, newEtag string) (updated bool) {
-	if newEtag == "" {
-		return true
-	}
-	updated = newEtag != s.etags[file]
-	if updated {
-		log.Debugf("File was updated, Etag: '%s' -> '%s'", s.etags[file], newEtag)
-	}
-	s.etags[file] = newEtag
-	return
+type IdenticalEtag struct {
+	File string
+	Etag string
+}
+
+func (e IdenticalEtag) Error() string {
+	return fmt.Sprintf("File %s is identical according to Etag: %s", e.File, e.Etag)
 }
 
 func (s *state) updateFile(file string) error {
-	log.Debugf("Refreshing cache from %v", file)
+	log.Debugf("Refreshing cache from %s", file)
 
 	s.lastts = time.Now().UTC()
 	data, wasModified, err := s.fetchFile(file)
 	if err != nil {
-		log.Error(err)
 		return err
 	}
 	LastRefresh.WithLabelValues(file).Set(float64(s.lastts.UnixNano() / 1e9))
@@ -344,7 +352,6 @@ func (s *state) updateFile(file string) error {
 			return errors.New(fmt.Sprintf("File is expired: %v", validtime))
 		}
 	}
-
 	if s.verify {
 		log.Debugf("Verifying signature in %v", file)
 		if roalistjson.Metadata.SignatureDate == "" || roalistjson.Metadata.Signature == "" {
@@ -467,6 +474,8 @@ func (s *state) routineUpdate(file string, interval int, slurmFile string) {
 		err := s.updateFile(file)
 		if err != nil {
 			switch err.(type) {
+			case IdenticalEtag:
+				log.Info(err)
 			case IdenticalFile:
 				log.Info(err)
 			default:
@@ -493,6 +502,7 @@ type state struct {
 	sendNotifs    bool
 	userAgent     string
 	etags         map[string]string
+	enableEtags   bool
 
 	server *rtr.Server
 
@@ -622,7 +632,8 @@ func main() {
 		verify:       *Verify,
 		checktime:    *TimeCheck,
 		userAgent:    *UserAgent,
-		etags:	      make(map[string]string),
+		etags:        make(map[string]string),
+		enableEtags:  *Etag,
 		lockJson:     &sync.RWMutex{},
 	}
 
@@ -779,6 +790,8 @@ func main() {
 	if err != nil {
 		switch err.(type) {
 		case IdenticalFile:
+			log.Info(err)
+		case IdenticalEtag:
 			log.Info(err)
 		default:
 			log.Errorf("Error updating: %v", err)
